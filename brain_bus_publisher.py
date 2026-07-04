@@ -1,59 +1,25 @@
 """brain_bus_publisher.py — PersonalStorageForge → the-brain live event wiring.
 
-Drop this file in the PersonalStorageForge repo root.
-Instruments the 7-stage pipeline (watch→OCR→organize→dedup→semantic→backup→oversee)
-so every significant event is pushed to brain.db.
-
-This is ADDITIVE to storage_brain_bridge.py (which does direct BrainSync writes).
-This module adds the harmony-engine-protocol bus layer + KG graph edges.
+Instruments the 7-stage pipeline (watch→OCR→organize→dedup→semantic→backup→oversee).
+This is ADDITIVE to storage_brain_bridge.py (direct BrainSync writes).
+This module uses get_brain() singleton + writes KG graph edges per file op.
 
 Usage:
     from brain_bus_publisher import publish_pipeline_event, publish_file_event
+    from brain_bus_publisher import publish_agentic_decision
 
     publish_file_event("file_organized", src="/tmp/scan.pdf", dst="~/Docs/2026/scan.pdf")
     publish_pipeline_event("backup_completed", stage="backup", detail="4 files → rclone s3")
+
+Requires:
+    Set BRAIN_SYNC_PATH env var to the directory containing brain_sync.py.
 """
 from __future__ import annotations
-import json, os, sys, uuid
-from datetime import datetime, timezone
+import json, uuid
 from pathlib import Path
+from _brain_client import get_client
 
 _SOURCE = "PersonalStorageForge"
-_REPO_ROOT = Path(__file__).resolve().parent
-
-STAGES = ["watch", "ocr", "organize", "dedup", "semantic_search", "backup", "oversee"]
-
-def _get_brain():
-    candidates = [
-        _REPO_ROOT.parent / "the-brain",
-        Path.home() / "the-brain",
-        Path.home() / "repos" / "the-brain",
-    ]
-    env_path = os.environ.get("BRAIN_REPO_PATH", "")
-    if env_path:
-        candidates.insert(0, Path(env_path))
-    for c in candidates:
-        if (c / "brain_sync.py").exists():
-            if str(c) not in sys.path:
-                sys.path.insert(0, str(c))
-            try:
-                from brain_sync import BrainSync  # type: ignore
-                return BrainSync()
-            except Exception as e:
-                print(f"[PSF brain_bus] import error: {e}")
-                return None
-    print("[PSF brain_bus] WARNING: the-brain not found. Set BRAIN_REPO_PATH.")
-    return None
-
-_brain = None
-_brain_resolved = False
-
-def _client():
-    global _brain, _brain_resolved
-    if not _brain_resolved:
-        _brain = _get_brain()
-        _brain_resolved = True
-    return _brain
 
 def publish_pipeline_event(
     event_type: str,
@@ -64,7 +30,7 @@ def publish_pipeline_event(
 ) -> bool:
     """Publish a pipeline stage event to brain.db."""
     rid = run_id or f"psf_{uuid.uuid4().hex[:8]}"
-    brain = _client()
+    brain = get_client()
     if brain is None:
         return False
     try:
@@ -91,7 +57,7 @@ def publish_file_event(
     detail = f"src={src} dst={dst}"
     if extra:
         detail += f" | {json.dumps(extra)}"
-    brain = _client()
+    brain = get_client()
     if brain is None:
         return False
     try:
@@ -101,10 +67,18 @@ def publish_file_event(
         )
         if src:
             brain.kg_add_node(
-                node_id=f"file:{src}", node_type="file",
+                node_id=f"file:{src}",
+                node_type="file",
                 label=Path(src).name,
                 properties={"managed_by": _SOURCE, "run_id": rid},
             )
+            if dst:
+                brain.kg_add_edge(
+                    source_id=f"file:{src}",
+                    target_id=f"file:{dst}",
+                    relation="moved_to",
+                    weight=1.0,
+                )
         return ok
     except Exception as e:
         print(f"[PSF brain_bus] file event error: {e}")
@@ -114,7 +88,7 @@ def publish_agentic_decision(
     decision: str, rationale: str,
     outcome: str = "pass", run_id: str | None = None,
 ) -> bool:
-    """Log an agentic oversight decision to the brain."""
+    """Log an agentic oversight decision from the oversee stage."""
     rid = run_id or f"psf_agent_{uuid.uuid4().hex[:8]}"
     return publish_pipeline_event(
         "agentic_decision", "oversee",
@@ -132,4 +106,28 @@ def publish_semantic_index_event(
         "semantic_indexed", src=file_path,
         outcome=outcome, run_id=run_id,
         extra={"model": embedding_model, "chunks": chunk_count},
+    )
+
+def publish_ocr_result(
+    file_path: str, page_count: int,
+    char_count: int, outcome: str = "pass",
+    run_id: str | None = None,
+) -> bool:
+    """Log an OCR extraction result from the ocr stage."""
+    return publish_file_event(
+        "ocr_completed", src=file_path,
+        outcome=outcome, run_id=run_id,
+        extra={"pages": page_count, "chars": char_count},
+    )
+
+def publish_backup_event(
+    destination: str, file_count: int,
+    size_mb: float, outcome: str = "pass",
+    run_id: str | None = None,
+) -> bool:
+    """Log a backup operation completion from the backup stage."""
+    return publish_pipeline_event(
+        "backup_completed", "backup",
+        detail=f"dest={destination} files={file_count} size_mb={size_mb:.1f}",
+        outcome=outcome, run_id=run_id,
     )
